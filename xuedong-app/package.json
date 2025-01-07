@@ -1,0 +1,15 @@
+{
+  "name": "ai-teacher",
+  "version": "1.0.0",
+  "scripts": {
+    "dev:app": "uni -p app",
+    "dev:h5": "uni"
+  },
+  "dependencies": {
+    "@dcloudio/uni-ui": "^1.5.7",
+    "axios": "^1.7.9",
+    "katex": "^0.16.19",
+    "marked": "^4.2.12",
+    "mp-html": "^2.5.0"
+  }
+}
