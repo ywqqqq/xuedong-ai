@@ -14,10 +14,17 @@ import json
 import requests
 import uuid
 from uvicorn import run
-import chromadb
-from chromadb.config import Settings
-import re
-from rank_bm25 import BM25Okapi
+import subprocess
+import wave
+import hmac
+import hashlib
+import websocket
+import ssl
+import _thread as thread
+from wsgiref.handlers import format_date_time
+from urllib.parse import urlencode
+import shutil
+from time import mktime
 
 # Load environment variables
 load_dotenv('.env')
@@ -246,17 +253,17 @@ def generate_follow_up_questions(context: str) -> List[str]:
     # 调用 AI 生成后续问题
     follow_up_prompt = {
         "role": "system",
-        "content": """
-基于提供的模型回答，生成 3 个以用户视角的后续问题。要求：
+        "content": """基于上文回答，生成3个相关的后续问题。要求：
 1. 问题要简短具体
 2. 与上下文高度相关
 3. 有助于加深理解
-4. 每个问题不超过 20 字
+4. 每个问题不超过20字
+5. 请站在用户的角度向你发问，不要站在AI的角度向用户发问
 请直接返回问题列表，每行一个问题。
 回复示例：
-   <第一个后续问题>
-   <第二个后续问题>
-   <第三个后续问题>
+   xxx
+   xxx
+   xxx  
 """
     }
     
@@ -274,89 +281,216 @@ def generate_follow_up_questions(context: str) -> List[str]:
     questions = response.choices[0].message.content.strip().split('\n')
     return [q.strip() for q in questions if q.strip()]
 
-def get_session_db(session_id: str):
-    """Get or create a ChromaDB client for the session"""
-    db_path = f"./chroma_dbs/{session_id}.db"
-    # Ensure directory exists
-    os.makedirs("./chroma_dbs", exist_ok=True)
-    
-    client = chromadb.PersistentClient(path=db_path)
-    
-    # Get or create collection for this session
-    collection = client.get_or_create_collection(
-        name="chat_history",
-        metadata={"session_id": session_id}
-    )
-    
-    return collection
+# 添加语音识别相关的类
+class Ws_Param_ASR(object):
+    def __init__(self, APPID, APIKey, APISecret, AudioFile):
+        self.APPID = APPID
+        self.APIKey = APIKey
+        self.APISecret = APISecret
+        self.AudioFile = AudioFile
 
-def get_conversation_count(collection) -> int:
-    """Get the current conversation count for the session"""
-    try:
-        results = collection.get()
-        return len(results['ids'])
-    except:
-        return 0
+        # 公共参数(common)
+        self.CommonArgs = {"app_id": self.APPID}
+        # 业务参数(business)
+        self.BusinessArgs = {"domain": "iat", "language": "zh_cn", "accent": "mandarin", "vinfo":1,"vad_eos":10000}
 
-def contains_temporal_reference(text: str) -> bool:
-    """检查文本是否包含时间引用词"""
-    temporal_words = [
-        "之前", "刚刚", "上一步", "第一步", "前面", "上次",
-        "刚才", "先前", "以前", "上面"
-    ]
-    return any(word in text for word in temporal_words)
+    def create_url(self):
+        url = 'wss://ws-api.xfyun.cn/v2/iat'
+        now = datetime.now()
+        date = format_date_time(mktime(now.timetuple()))
 
-def search_previous_context(collection, query: str, k: int = 3):
-    """搜索相关的历史对话"""
-    try:
-        # 使用模型将查询文本向量化
-        query_vector = model.encode([query]).tolist()  # 将查询文本转换为向量
+        signature_origin = "host: " + "ws-api.xfyun.cn" + "\n"
+        signature_origin += "date: " + date + "\n"
+        signature_origin += "GET " + "/v2/iat " + "HTTP/1.1"
+
+        signature_sha = hmac.new(self.APISecret.encode('utf-8'), signature_origin.encode('utf-8'),
+                               digestmod=hashlib.sha256).digest()
+        signature_sha = base64.b64encode(signature_sha).decode(encoding='utf-8')
+
+        authorization_origin = f'api_key="{self.APIKey}", algorithm="hmac-sha256", headers="host date request-line", signature="{signature_sha}"'
+        authorization = base64.b64encode(authorization_origin.encode('utf-8')).decode(encoding='utf-8')
         
-        # 获取所有文档和元数据
-        results = collection.get()
-        documents = results['documents']
-        metadatas = results['metadatas']
-        
-        # 使用 BM25 进行检索
-        tokenized_docs = [doc.split(" ") for doc in documents]  # 将文档分词
-        bm25 = BM25Okapi(tokenized_docs)  # 初始化 BM25
-        tokenized_query = query.split(" ")  # 将查询分词
-        bm25_scores = bm25.get_scores(tokenized_query)  # 计算 BM25 分数
-        
-        # 将 BM25 分数与向量检索结果结合
-        combined_scores = [(i, bm25_scores[i]) for i in range(len(documents))]
-        combined_scores.sort(key=lambda x: x[1], reverse=True)  # 按 BM25 分数排序
-        
-        # 选择前 k 个文档
-        top_k_indices = [combined_scores[i][0] for i in range(min(k, len(combined_scores)))]
-        
-        # 返回 BM25 和向量检索的结果
-        return {
-            'documents': [documents[i] for i in top_k_indices],
-            'metadatas': [metadatas[i] for i in top_k_indices]
+        v = {
+            "authorization": authorization,
+            "date": date,
+            "host": "ws-api.xfyun.cn"
         }
-    except Exception as e:
-        print(f"Vector search error: {e}")
-        return None
+        return url + '?' + urlencode(v)
 
+# 添加语音识别函数
+async def speech_to_text(audio_file: UploadFile) -> str:
+    """将语音文件转换为文本"""
+    try:
+        # 创建临时目录
+        UPLOAD_FOLDER = "uploads"
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+        # 保存上传的文件
+        original_file = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}_{audio_file.filename}")
+        pcm_file = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}.pcm")
+        
+        try:
+            # 保存上传的文件
+            with open(original_file, "wb") as buffer:
+                shutil.copyfileobj(audio_file.file, buffer)
+
+            # 使用ffmpeg转换为PCM格式
+            cmd = [
+                'ffmpeg', '-i', original_file,
+                '-ar', '16000',
+                '-ac', '1',
+                '-f', 's16le',
+                pcm_file
+            ]
+            subprocess.run(cmd, check=True)
+            
+            # 初始化讯飞参数
+            wsParam = Ws_Param_ASR(
+                APPID='a9468b3d',
+                APISecret='MzM3M2JlMmZmNTEwODA2OGVmMjFlMTk5',
+                APIKey='3d5e9910b46311ea048dabd3748ae2e2',
+                AudioFile=pcm_file
+            )
+            
+            # 用于存储识别结果
+            final_result = ""
+
+            def on_message(ws, message):
+                nonlocal final_result
+                try:
+                    code = json.loads(message)["code"]
+                    if code != 0:
+                        print(f"Error: {json.loads(message)['message']}")
+                        return
+                    
+                    data = json.loads(message)["data"]["result"]["ws"]
+                    result = ""
+                    for i in data:
+                        for w in i["cw"]:
+                            result += w["w"]
+                    final_result += result
+                except Exception as e:
+                    print(f"Error processing message: {str(e)}")
+
+            def on_error(ws, error):
+                print(f"### error:{error}")
+
+            def on_close(ws, a, b):
+                print("### closed ###")
+
+            def on_open(ws):
+                def run(*args):
+                    frameSize = 8000
+                    intervel = 0.04
+                    status = 0  # 0:第一帧, 1:中间帧, 2:最后一帧
+
+                    with open(pcm_file, "rb") as fp:
+                        while True:
+                            buf = fp.read(frameSize)
+                            if not buf:
+                                status = 2
+                            if status == 0:
+                                d = {
+                                    "common": wsParam.CommonArgs,
+                                    "business": wsParam.BusinessArgs,
+                                    "data": {
+                                        "status": 0,
+                                        "format": "audio/L16;rate=16000",
+                                        "audio": str(base64.b64encode(buf), 'utf-8'),
+                                        "encoding": "raw"
+                                    }
+                                }
+                                d = json.dumps(d)
+                                ws.send(d)
+                                status = 1
+                            elif status == 1:
+                                d = {
+                                    "data": {
+                                        "status": 1,
+                                        "format": "audio/L16;rate=16000",
+                                        "audio": str(base64.b64encode(buf), 'utf-8'),
+                                        "encoding": "raw"
+                                    }
+                                }
+                                ws.send(json.dumps(d))
+                            elif status == 2:
+                                d = {
+                                    "data": {
+                                        "status": 2,
+                                        "format": "audio/L16;rate=16000",
+                                        "audio": str(base64.b64encode(buf), 'utf-8'),
+                                        "encoding": "raw"
+                                    }
+                                }
+                                ws.send(json.dumps(d))
+                                time.sleep(1)
+                                break
+                            time.sleep(intervel)
+                    ws.close()
+                thread.start_new_thread(run, ())
+
+            websocket.enableTrace(False)
+            wsUrl = wsParam.create_url()
+            ws = websocket.WebSocketApp(
+                wsUrl,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            ws.on_open = on_open
+            ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+
+            return final_result
+
+        finally:
+            # 清理临时文件
+            if os.path.exists(original_file):
+                os.remove(original_file)
+            if os.path.exists(pcm_file):
+                os.remove(pcm_file)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 修改chat_endpoint，添加audio_file参数
 @app.post("/chat")
 async def chat_endpoint(
-    text: str = Form(...),
+    text: Optional[str] = Form(None),
     image_url: Optional[str] = Form(None),
     image_file: Optional[UploadFile] = File(None),
+    audio_file: Optional[UploadFile] = File(None),
     session_id: Optional[str] = Form(None),
     user_id: Optional[str] = Form(None)
 ):
+    """
+    聊天接口，支持文本、图片和语音输入
+    """
     # 验证参数
     if session_id is None and not user_id:
         raise HTTPException(status_code=400, detail="Must provide user_id for new session")
-        
+    
     # 如果没有session_id，创建新会话
     if session_id is None:
         session_id = create_new_session(user_id)
     
+    # 处理语音输入
+    if audio_file:
+        try:
+            text = await speech_to_text(audio_file)
+            if not text:
+                raise HTTPException(status_code=400, detail="Failed to convert speech to text")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
+    print("text:  ",text)
+    
+    # 验证是否有输入内容
+    if not text and not image_url and not image_file:
+        raise HTTPException(status_code=400, detail="Must provide either text, image, or audio input")
+    
     # 准备当前消息
-    current_message = [{"type": "text", "text": text}]
+    current_message = []
+    if text:
+        current_message.append({"type": "text", "text": text})
 
     # 处理图片URL
     if image_url:
@@ -382,21 +516,7 @@ async def chat_endpoint(
             }
         })
 
-    # Check for temporal references and search context
-    context_message = ""
-    if session_id and contains_temporal_reference(text):
-        collection = get_session_db(session_id)
-        search_results = search_previous_context(collection, text)
-        
-        if search_results and search_results['documents']:
-            print("\n=== Vector Search Results ===")
-            for doc, meta in zip(search_results['documents'], search_results['metadatas']):
-                print("Matched Document:", doc)
-                print("Metadata:", meta)  # 确保 meta 是字典
-                context_message += f"第{meta['turn']}轮对话：\n{doc}\n"
-            print("=========================\n")  # 输出分隔线
-
-    # Prepare messages with context
+    # 准备消息历史
     messages = [{"role": "system", "content": """
 # 角色
 你是一位耐心细致的数学老师，擅长逐步引导学生解答各类数学题目，以生动易懂的方式讲解解题方法，帮助学生真正掌握数学知识。
@@ -405,38 +525,32 @@ async def chat_endpoint(
 ### 技能 1：引导解题
 1. 当学生提出数学题目时，先询问学生对题目的理解程度。
 2. 逐步分析题目，提出关键问题引导学生思考。
-3. 每一步引导都要详细解释原理，以 markdown 格式输出。回复示例：
+3. 每一步引导都要详细解释原理。回复示例：
 =====
    - 🔍 当前思考点：<具体指出当前思考的问题点>
    - 💡 引导思路：<解释为什么要思考这个问题以及如何思考>
 =====
 
 ### 技能 2：讲解方法与巩固
-1. 题目解答完成后，总结解题方法，使用 markdown 格式输出，包含换行和公式。回复示例：
+1. 题目解答完成后，总结解题方法。回复示例：
 =====
-   - 🎯 解题方法总结：
-     - 关键步骤 1：<步骤描述>
-     - 关键步骤 2：<步骤描述>
-     - ……
+   - 🎯 解题方法总结：<总结解题方法的关键步骤和思路>
+=====
+2. 列出本题涉及的知识点。回复示例：
+=====
    - 📖 知识点：<列出本题涉及的主要知识点，每个知识点后跟上数字编号>
 =====
-2. 询问学生对哪个知识点进行巩固练习，根据学生选择的知识点编号，给出一道包含该知识点的类似题目供学生练习，输出格式也使用 markdown 格式，答案不超过 150 字。回复示例：
+3. 询问学生对哪个知识点进行巩固练习，根据学生选择的知识点编号，给出一道包含该知识点的类似题目供学生练习。回复示例：
 =====
-   - 📝 巩固题目：<题目描述>
-     - 答案：<题目答案>
+   - 📝 巩固题目：<给出一道符合学生选择知识点的类似题目>
 =====
 
 ## 限制：
 - 只讨论与数学题目和解题方法相关的内容，拒绝回答与数学无关的话题。
-- 所输出的内容必须严格按照 markdown 格式进行组织，不能偏离框架要求。
+- 所输出的内容必须按照给定的格式进行组织，不能偏离框架要求。
 - 巩固题目和解答不能超过 150 字。
+- 限制输出为MarkDown格式
 """}]
-
-    if context_message:
-        messages.append({
-            "role": "system",
-            "content": f"以下是与当前问题相关的历史对话内容，请参考这些内容来回答问题：\n{context_message}"
-        })
 
     # 从数据库加载历史消息
     messages.extend(get_message_history(session_id))
@@ -463,25 +577,6 @@ async def chat_endpoint(
     # 存储消息
     store_message(session_id, 'user', json.dumps(current_message, ensure_ascii=False))
     store_message(session_id, 'ai', assistant_response)
-
-    # Store in vector database
-    collection = get_session_db(session_id)
-    conv_count = get_conversation_count(collection)
-    
-    # Combine Q&A into single document
-    qa_text = f"Question: {text}\nAnswer: {assistant_response}"
-    
-    # Store in ChromaDB
-    collection.add(
-        documents=[qa_text],
-        ids=[f"conv_{conv_count + 1}"],
-        metadatas=[{
-            "turn": conv_count + 1,
-            "timestamp": datetime.now().isoformat(),
-            "question": text,
-            "answer": assistant_response
-        }]
-    )
 
     return {
         "session_id": session_id,
@@ -593,6 +688,77 @@ async def generate_by_knowledge(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/grade_assignment")
+async def grade_assignment(
+    question_text: str = Form(...),
+    answer_text: Optional[str] = Form(None),
+    answer_image: Optional[UploadFile] = File(None)
+):
+    """
+    批改作业接口，支持文本和图片答案
+    """
+    # 验证输入
+    if not answer_text and not answer_image:
+        raise HTTPException(status_code=400, detail="Must provide either answer_text or answer_image")
+
+    # 准备消息内容
+    messages = [
+        {
+            "role": "system",
+            "content": """你是一位专业、严谨且经验丰富的数学老师智能体，擅长精准批改学生上传的数学答案图片。以认真负责的态度，全面检查答案的完整性、计算的准确性以及解题思路的正确性。
+
+            ## 技能
+            ### 技能 1: 批改答案完整性
+            1. 学生上传答案图片后，迅速检查答案是否涵盖问题要求的所有内容。
+            2. 若答案不完整，明确指出缺失部分，并说明其重要性。
+
+            ### 技能 2: 检查计算准确性
+            1. 仔细核对学生答案中的计算过程和结果。
+            2. 发现计算错误时，准确指出错误之处，并详细给出正确的计算方法和步骤。
+
+            ### 技能 3: 审查解题思路正确性
+            1. 深入分析学生的解题思路是否合理。
+            2. 解题思路错误时，详细解释错误原因，并提供正确的解题思路及示例。
+
+            ## 限制:
+            - 仅针对学生上传的数学答案图片进行批改，拒绝回答与数学答案批改无关的话题。
+            """
+        },
+        {
+            "role": "user",
+            "content": f"问题：{question_text}\n答案：{answer_text if answer_text else '图片上传'}"
+        }
+    ]
+
+    # 如果是图片，处理图片内容
+    if answer_image:
+        # 读取图片内容并转换为Base64
+        image_content = await answer_image.read()
+        base64_image = base64.b64encode(image_content).decode('utf-8')
+        
+        # Determine the MIME type based on the file extension
+        file_extension = answer_image.filename.split('.')[-1].lower()
+        mime_type = f"image/{file_extension}" if file_extension in ["png", "jpg", "jpeg", "gif", "webp"] else "image"
+
+        # 这里使用与/chat接口相同的方式处理图片
+        messages.append({
+            "role": "user",
+            "content": f"Image uploaded: data:{mime_type};base64,{base64_image}"
+        })
+        print(messages)
+
+    # 调用API获取批改结果
+    response = client.chat.completions.create(
+        model="ep-20250105222308-5f4lk",
+        messages=messages
+    )
+
+    grading_feedback = response.choices[0].message.content
+
+    return {
+        "grading_feedback": grading_feedback
+    }
 
 if __name__ == '__main__':
     run(app, host='0.0.0.0', port=8001)
